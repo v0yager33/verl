@@ -396,7 +396,349 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
             return outputs
+        
+    def _compute_vcpo_loss_for_micro_batch(
+        self,
+        model,
+        micro_batch,
+        model_inputs,
+        response_length: int,
+        vcpo_mode: str,
+        vcpo_temperature: float,
+        vcpo_answer_tag: str,
+        tokenizer,
+        multi_modal_inputs: dict,
+    ) -> Optional[torch.Tensor]:
+        """Compute VCPO causal alignment loss for a micro-batch.
 
+        For VCPO-SA mode:
+            1. For each sample, find answer tokens in the response
+            2. Compute gradient attribution for the current sample
+            3. Group samples by uid, collect correct samples' attributions
+            4. Compute target P_SA as mean of correct samples' attributions
+            5. Compute KL(P_current || P_SA) for each sample
+
+        For VCPO-SD mode:
+            1. Use ground truth data to compute target P_SD
+            2. Compute KL(P_current || P_SD) for each sample
+
+        Args:
+            model: The actor model.
+            micro_batch: Current micro-batch DataProto.
+            model_inputs: Dict of model inputs.
+            response_length: Length of response tokens.
+            vcpo_mode: "sa" or "sd".
+            vcpo_temperature: Temperature for softmax normalization.
+            vcpo_answer_tag: Tag to extract answer tokens.
+            tokenizer: Tokenizer instance.
+            multi_modal_inputs: Multi-modal inputs dict.
+
+        Returns:
+            Scalar VCPO loss, or None if no valid samples.
+        """
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        position_ids = model_inputs["position_ids"]
+        responses = model_inputs["responses"]
+        batch_size = input_ids.shape[0]
+
+        # Detect image token ID from model config
+        model_config = getattr(model, "config", None)
+        if model_config is None:
+            model_config = getattr(getattr(model, "module", model), "config", None)
+
+        image_token_id = getattr(model_config, "image_token_id", 151655)
+
+        # Create image token mask
+        image_token_mask = (input_ids == image_token_id)  # (batch_size, seq_len)
+
+        # Check if there are any visual tokens
+        if not image_token_mask.any():
+            return None
+
+        num_visual_tokens = image_token_mask[0].sum().item()
+        if num_visual_tokens == 0:
+            return None
+
+        # Find answer token positions for each sample
+        answer_positions_list = find_answer_token_positions(
+            responses, tokenizer, vcpo_answer_tag
+        )
+
+        if vcpo_mode == "sa":
+            return self._compute_vcpo_sa_loss(
+                model=model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                responses=responses,
+                response_length=response_length,
+                answer_positions_list=answer_positions_list,
+                image_token_mask=image_token_mask,
+                multi_modal_inputs=multi_modal_inputs,
+                model_inputs=model_inputs,
+                batch_size=batch_size,
+                vcpo_temperature=vcpo_temperature,
+                tokenizer=tokenizer,
+                vcpo_answer_tag=vcpo_answer_tag,
+            )
+        elif vcpo_mode == "sd":
+            return self._compute_vcpo_sd_loss(
+                model=model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                responses=responses,
+                response_length=response_length,
+                answer_positions_list=answer_positions_list,
+                image_token_mask=image_token_mask,
+                multi_modal_inputs=multi_modal_inputs,
+                model_inputs=model_inputs,
+                batch_size=batch_size,
+                vcpo_temperature=vcpo_temperature,
+                tokenizer=tokenizer,
+                vcpo_answer_tag=vcpo_answer_tag,
+            )
+        return None
+
+    def _compute_vcpo_sa_loss(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        position_ids,
+        responses,
+        response_length,
+        answer_positions_list,
+        image_token_mask,
+        multi_modal_inputs,
+        model_inputs,
+        batch_size,
+        vcpo_temperature,
+        tokenizer,
+        vcpo_answer_tag,
+    ) -> Optional[torch.Tensor]:
+        """Compute VCPO-SA loss using Self-Alignment (group consensus of correct samples).
+
+        Steps:
+            1. Compute gradient attribution for each sample that has an answer
+            2. Group by uid, compute P_SA from correct samples within each group
+            3. Compute KL(P_i || P_SA) for each sample in the group
+        """
+        # Get rewards for identifying correct samples
+        vcpo_rewards = model_inputs.get("vcpo_rewards", None)
+        uids = model_inputs.get("uid", None)
+
+        # Compute gradient attributions for all samples with answers
+        sample_attributions = {}  # idx -> gradient_attribution
+        for i in range(batch_size):
+            if answer_positions_list[i] is None:
+                continue
+
+            grad_attr = compute_gradient_attribution(
+                model=model,
+                input_ids=input_ids[i : i + 1],
+                attention_mask=attention_mask[i : i + 1],
+                position_ids=position_ids[i : i + 1] if position_ids.dim() == 2
+                    else position_ids[:, i : i + 1, :],
+                response_length=response_length,
+                answer_token_positions=answer_positions_list[i],
+                image_token_mask=image_token_mask[i : i + 1],
+                multi_modal_inputs=self._slice_multi_modal_inputs(multi_modal_inputs, i),
+                temperature=1.0,
+            )
+
+            if grad_attr is not None:
+                sample_attributions[i] = grad_attr
+
+        if len(sample_attributions) == 0:
+            return None
+
+        # Group samples by uid and compute P_SA for each group
+        if uids is not None and vcpo_rewards is not None:
+            # Group by uid
+            uid_to_indices = {}
+            for i in range(batch_size):
+                uid = uids[i] if isinstance(uids, (list, tuple)) else uids
+                if uid not in uid_to_indices:
+                    uid_to_indices[uid] = []
+                uid_to_indices[uid].append(i)
+
+            # For each group, compute P_SA from correct samples
+            group_targets = {}  # uid -> P_SA
+            for uid, indices in uid_to_indices.items():
+                correct_attrs = []
+                for idx in indices:
+                    if idx in sample_attributions and vcpo_rewards[idx].item() == 1.0:
+                        prob = compute_causal_probability(
+                            sample_attributions[idx], vcpo_temperature
+                        )
+                        correct_attrs.append(prob)
+
+                if len(correct_attrs) > 0:
+                    stacked = torch.stack(correct_attrs, dim=0)
+                    mean_attr = stacked.mean(dim=0)
+                    group_targets[uid] = compute_causal_probability(
+                        mean_attr, vcpo_temperature
+                    )
+
+            # Compute KL loss for each sample
+            kl_losses = []
+            for i in range(batch_size):
+                if i not in sample_attributions:
+                    continue
+                uid = uids[i] if isinstance(uids, (list, tuple)) else uids
+                if uid not in group_targets:
+                    continue
+
+                kl_loss = compute_vcpo_kl_loss(
+                    current_attribution=sample_attributions[i],
+                    target_attribution=group_targets[uid],
+                    temperature=vcpo_temperature,
+                )
+                kl_losses.append(kl_loss)
+
+            if len(kl_losses) == 0:
+                return None
+
+            return torch.stack(kl_losses).mean()
+        else:
+            # Fallback: use all samples with answers as a single group
+            all_attrs = []
+            for idx, attr in sample_attributions.items():
+                prob = compute_causal_probability(attr, vcpo_temperature)
+                all_attrs.append(prob)
+
+            if len(all_attrs) < 2:
+                return None
+
+            target = torch.stack(all_attrs, dim=0).mean(dim=0)
+            target = compute_causal_probability(target, vcpo_temperature)
+
+            kl_losses = []
+            for idx, attr in sample_attributions.items():
+                kl_loss = compute_vcpo_kl_loss(attr, target, vcpo_temperature)
+                kl_losses.append(kl_loss)
+
+            return torch.stack(kl_losses).mean()
+
+    def _compute_vcpo_sd_loss(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        position_ids,
+        responses,
+        response_length,
+        answer_positions_list,
+        image_token_mask,
+        multi_modal_inputs,
+        model_inputs,
+        batch_size,
+        vcpo_temperature,
+        tokenizer,
+        vcpo_answer_tag,
+    ) -> Optional[torch.Tensor]:
+        """Compute VCPO-SD loss using Self-Distillation (ground truth answer).
+
+        Steps:
+            1. Use GT data to compute P_SD (target attribution)
+            2. Compute gradient attribution for each rollout sample
+            3. Compute KL(P_i || P_SD) for each sample
+        """
+        gt_input_ids = model_inputs.get("gt_input_ids", None)
+        gt_attention_mask = model_inputs.get("gt_attention_mask", None)
+        gt_position_ids = model_inputs.get("gt_position_ids", None)
+        gt_response_length = model_inputs.get("gt_response_length", None)
+
+        if gt_input_ids is None:
+            return None
+
+        # Compute P_SD from ground truth
+        gt_image_token_mask = (gt_input_ids == image_token_mask.long().sum())
+        # Re-detect image token ID
+        model_config = getattr(model, "config", None)
+        if model_config is None:
+            model_config = getattr(getattr(model, "module", model), "config", None)
+        image_token_id = getattr(model_config, "image_token_id", 151655)
+        gt_image_token_mask = (gt_input_ids == image_token_id)
+
+        gt_response_ids = gt_input_ids[:, -gt_response_length:]
+        gt_answer_positions = find_answer_token_positions(
+            gt_response_ids, tokenizer, vcpo_answer_tag
+        )
+
+        if gt_answer_positions[0] is None:
+            return None
+
+        # Compute target attribution from GT
+        gt_grad_attr = compute_gradient_attribution(
+            model=model,
+            input_ids=gt_input_ids[0:1],
+            attention_mask=gt_attention_mask[0:1],
+            position_ids=gt_position_ids[0:1] if gt_position_ids.dim() == 2
+                else gt_position_ids[:, 0:1, :],
+            response_length=gt_response_length,
+            answer_token_positions=gt_answer_positions[0],
+            image_token_mask=gt_image_token_mask[0:1],
+            multi_modal_inputs=self._slice_multi_modal_inputs(multi_modal_inputs, 0),
+            temperature=1.0,
+        )
+
+        if gt_grad_attr is None:
+            return None
+
+        target_prob = compute_causal_probability(gt_grad_attr, vcpo_temperature)
+
+        # Compute KL loss for each rollout sample
+        kl_losses = []
+        for i in range(batch_size):
+            if answer_positions_list[i] is None:
+                continue
+
+            grad_attr = compute_gradient_attribution(
+                model=model,
+                input_ids=input_ids[i : i + 1],
+                attention_mask=attention_mask[i : i + 1],
+                position_ids=position_ids[i : i + 1] if position_ids.dim() == 2
+                    else position_ids[:, i : i + 1, :],
+                response_length=response_length,
+                answer_token_positions=answer_positions_list[i],
+                image_token_mask=image_token_mask[i : i + 1],
+                multi_modal_inputs=self._slice_multi_modal_inputs(multi_modal_inputs, i),
+                temperature=1.0,
+            )
+
+            if grad_attr is not None:
+                kl_loss = compute_vcpo_kl_loss(
+                    grad_attr, target_prob, vcpo_temperature
+                )
+                kl_losses.append(kl_loss)
+
+        if len(kl_losses) == 0:
+            return None
+
+        return torch.stack(kl_losses).mean()
+
+    # _slice_multi_modal_inputs 方法对于 VLM 的多模态输入切片是简化版本。
+    # 在实际实现中，需要根据具体的 VLM 模型（如 Qwen2.5-VL）的多模态输入格式进行适配。
+    # 对于 Qwen2.5-VL，pixel_values 是所有图片 patch 拼接在一起的，
+    # image_grid_thw 记录了每张图的 grid 信息，
+    # 切片时需要根据 image_grid_thw 来正确分割 pixel_values。
+    @staticmethod
+    def _slice_multi_modal_inputs(multi_modal_inputs: dict, index: int) -> dict:
+        """Slice multi-modal inputs for a single sample from a batch."""
+        sliced = {}
+        for key, value in multi_modal_inputs.items():
+            if isinstance(value, torch.Tensor):
+                if value.dim() > 0 and value.shape[0] > index:
+                    sliced[key] = value[index : index + 1]
+                else:
+                    sliced[key] = value
+            else:
+                sliced[key] = value
+        return sliced
+    
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -541,9 +883,6 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
-        # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
-        if "rollout_log_probs" in data.batch.keys():
-            select_keys.append("rollout_log_probs")
         
         #===========================================================================
         # === VCPO: include reward scores and uid for group-based SA computation ===
@@ -555,6 +894,41 @@ class DataParallelPPOActor(BasePPOActor):
                 for key in ["gt_input_ids", "gt_attention_mask", "gt_position_ids", "gt_response_length"]:
                     if key in data.batch.keys():
                         select_keys.append(key)
+        #===========================================================================
+
+        # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
+        if "rollout_log_probs" in data.batch.keys():
+            select_keys.append("rollout_log_probs")
+
+        #===========================================================================
+        # === VCPO: include reward scores and uid for group-based SA computation ===
+        if self.config.get("use_vcpo_loss", False):
+                        vcpo_mode = self.config.get("vcpo_mode", "sa")
+                        vcpo_alpha = self.config.get("vcpo_alpha", 0.1)
+                        vcpo_temperature = self.config.get("vcpo_temperature", 1.0)
+                        vcpo_answer_tag = self.config.get("vcpo_answer_tag", "boxed")
+
+                        # Get tokenizer from meta_info
+                        tokenizer = data.meta_info.get("tokenizer", None)
+
+                        if tokenizer is not None:
+                            vcpo_loss_value = self._compute_vcpo_loss_for_micro_batch(
+                                model=self.actor_module,
+                                micro_batch=micro_batch,
+                                model_inputs=model_inputs,
+                                response_length=micro_batch.batch["responses"].size(-1),
+                                vcpo_mode=vcpo_mode,
+                                vcpo_temperature=vcpo_temperature,
+                                vcpo_answer_tag=vcpo_answer_tag,
+                                tokenizer=tokenizer,
+                                multi_modal_inputs=multi_modal_inputs
+                                    if "multi_modal_inputs" in model_inputs else {},
+                            )
+
+                            if vcpo_loss_value is not None:
+                                policy_loss = policy_loss + vcpo_alpha * vcpo_loss_value
+                                micro_batch_metrics["actor/vcpo_loss"] = vcpo_loss_value.detach().item()
+                                micro_batch_metrics["actor/vcpo_alpha"] = vcpo_alpha
         #===========================================================================
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
