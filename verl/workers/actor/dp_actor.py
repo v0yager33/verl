@@ -40,6 +40,13 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from verl.workers.utils.vcpo import (
+    find_answer_token_positions,
+    compute_gradient_attribution,
+    compute_causal_probability,
+    compute_vcpo_sa_target,
+    compute_vcpo_kl_loss,
+)
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -537,6 +544,18 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        
+        #===========================================================================
+        # === VCPO: include reward scores and uid for group-based SA computation ===
+        if self.config.get("use_vcpo_loss", False):
+            if "vcpo_rewards" in data.batch.keys():
+                select_keys.append("vcpo_rewards")
+            # For VCPO-SD, we need ground truth data
+            if self.config.get("vcpo_mode", "sa") == "sd":
+                for key in ["gt_input_ids", "gt_attention_mask", "gt_position_ids", "gt_response_length"]:
+                    if key in data.batch.keys():
+                        select_keys.append(key)
+        #===========================================================================
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
