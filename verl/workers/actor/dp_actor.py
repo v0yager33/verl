@@ -907,6 +907,12 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
+        
+        # === VCPO: SA 模式需要 uid 来分组样本 ===
+        if (self.config.get("use_vcpo_loss", False)
+                and "uid" in data.non_tensor_batch.keys()
+                and "uid" not in non_tensor_select_keys):
+            non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
