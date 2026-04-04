@@ -1216,6 +1216,31 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+
+        # ========== VCPO: 传递 tokenizer 和 reward 信息 ==========
+        vcpo_mode = self.config.algorithm.get("vcpo_mode", None)
+        if vcpo_mode is not None:
+            # 传递 tokenizer（dp_actor 中需要用来 decode response 找答案位置）
+            batch.meta_info["tokenizer"] = self.tokenizer
+
+            # 传递 reward 信息：将 token_level_scores 的 sum 作为 vcpo_rewards
+            # vcpo_rewards 用于 SA 模式下区分正确/错误样本
+            if "token_level_scores" in batch.batch:
+                vcpo_rewards = batch.batch["token_level_scores"].sum(dim=-1)  # (batch_size,)
+                batch.batch["vcpo_rewards"] = vcpo_rewards
+
+            # VCPO-SD: 准备 GT 输入数据
+            if vcpo_mode == "sd":
+                gt_data = self._prepare_vcpo_sd_gt_inputs(batch)
+                if gt_data is not None:
+                    for key, value in gt_data.items():
+                        if isinstance(value, torch.Tensor):
+                            batch.batch[key] = value
+                        else:
+                            # gt_multi_modal_inputs 是 list，存入 non_tensor_batch
+                            batch.non_tensor_batch[key] = np.array(value, dtype=object)
+        # ========== VCPO END ==========
+
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1697,7 +1722,7 @@ class RayPPOTrainer:
         3. 拼接为 [user_message, assistant_message] 的完整对话
         4. 调用 processor.apply_chat_template() 应用 chat template
         5. 调用 processor() 进行 tokenize + 图片处理
-        6. 返回 gt_input_ids, gt_attention_mask, gt_pixel_values 等
+        6. 返回 gt_input_ids, gt_attention_mask, gt_multi_modal_inputs 等
 
         Args:
             data: DataProto，包含 non_tensor_batch["extra_info"] 和 non_tensor_batch["raw_prompt"]
@@ -1706,6 +1731,10 @@ class RayPPOTrainer:
             dict with keys: gt_input_ids, gt_attention_mask, gt_response_length, gt_multi_modal_inputs
             如果所有 reference 都不存在，返回 None
         """
+        import copy
+        from PIL import Image
+        from io import BytesIO
+
         extra_infos = data.non_tensor_batch.get("extra_info", None)
         raw_prompts = data.non_tensor_batch.get("raw_prompt", None)
 
@@ -1722,7 +1751,7 @@ class RayPPOTrainer:
         if len(valid_refs) == 0:
             return None
 
-        processor = self.processor  # verl 的 RayPPOTrainer 持有 processor
+        processor = self.processor
         tokenizer = self.tokenizer
 
         gt_input_ids_list = []
@@ -1734,33 +1763,37 @@ class RayPPOTrainer:
             if reference is None:
                 reference = ""
 
-            # ========== 关键：构造完整的对话消息列表 ==========
-            # raw_prompt 已经是经过 _build_messages() 处理的消息列表，
-            # 其中图片已经被替换为 {"type": "image", "image": PIL.Image} 格式
-            import copy
+            # ========== 构造完整的对话消息列表 ==========
             messages = copy.deepcopy(raw_prompts[i])
-
-            # 追加 assistant 消息（reference 内容）
             messages.append({"role": "assistant", "content": reference})
 
-            # ========== 关键：应用 Chat Template ==========
-            # 使用 processor.apply_chat_template 而非直接 tokenize
-            # 这会正确添加 <|im_start|>assistant\n ... <|im_end|> 等特殊 token
+            # ========== 应用 Chat Template ==========
             raw_text = processor.apply_chat_template(
                 messages,
-                add_generation_prompt=False,  # False: 不添加末尾的 assistant 提示
+                add_generation_prompt=False,
                 tokenize=False,
             )
 
-            # ========== 处理图片并 tokenize ==========
-            # 从消息中提取图片（与 AgentLoop 中的处理方式一致）
-            from verl.utils.dataset.rl_dataset import RLHFDataset
-            images, videos = await RLHFDataset.process_vision_info(
-                messages=raw_prompts[i],  # 使用原始 prompt 的图片
-                image_patch_size=self.config.data.get("image_patch_size", None),
-                config=self.config.data,
-            )
+            # ========== 同步提取图片 ==========
+            images = []
+            for msg in raw_prompts[i]:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "image":
+                            img = item.get("image", None)
+                            if img is not None:
+                                if isinstance(img, Image.Image):
+                                    images.append(img.convert("RGB"))
+                                elif isinstance(img, dict) and "bytes" in img:
+                                    images.append(
+                                        Image.open(BytesIO(img["bytes"])).convert("RGB")
+                                    )
 
+            if not images:
+                images = None
+
+            # ========== Tokenize + 图片处理 ==========
             if images:
                 encoded = processor(
                     text=[raw_text],
@@ -1773,7 +1806,7 @@ class RayPPOTrainer:
                     return_tensors="pt",
                     truncation=True,
                     max_length=(self.config.data.max_prompt_length
-                            + self.config.data.max_response_length),
+                                + self.config.data.max_response_length),
                 )
 
             gt_input_ids_list.append(encoded["input_ids"].squeeze(0))
@@ -1787,14 +1820,16 @@ class RayPPOTrainer:
             gt_multi_modal_inputs_list.append(mm_inputs)
 
             # ========== 计算 reference 部分的 token 长度 ==========
-            # 方法：对比 prompt-only 和 prompt+reference 的 token 数差值
+            prompt_only_messages = copy.deepcopy(raw_prompts[i])
             prompt_only_text = processor.apply_chat_template(
-                raw_prompts[i],
+                prompt_only_messages,
                 add_generation_prompt=True,
                 tokenize=False,
             )
             if images:
-                prompt_only_encoded = processor(text=[prompt_only_text], images=images, return_tensors="pt")
+                prompt_only_encoded = processor(
+                    text=[prompt_only_text], images=images, return_tensors="pt"
+                )
             else:
                 prompt_only_encoded = tokenizer(prompt_only_text, return_tensors="pt")
 
@@ -1818,7 +1853,6 @@ class RayPPOTrainer:
             "gt_response_length": max(gt_response_lengths),
         }
 
-        # 将多模态输入也存入（用于 GT 前向传播时传给模型）
         if gt_multi_modal_inputs_list:
             result["gt_multi_modal_inputs"] = gt_multi_modal_inputs_list
 
