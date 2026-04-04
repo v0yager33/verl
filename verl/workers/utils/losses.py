@@ -133,6 +133,17 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
 
+    # ============================================================================
+    # add vcpo loss
+    if config.get("use_vcpo_loss", False):
+        vcpo_loss_value = data.get("vcpo_loss", None)
+        if vcpo_loss_value is not None:
+            vcpo_alpha = config.get("vcpo_alpha", 0.1)
+            policy_loss += vcpo_alpha * vcpo_loss_value
+            metrics["vcpo_loss"] = Metric(value=vcpo_loss_value, aggregation=metric_aggregation)
+            metrics["vcpo_alpha"] = vcpo_alpha
+    # ============================================================================
+
     return policy_loss, metrics
 
 
