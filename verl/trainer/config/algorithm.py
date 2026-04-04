@@ -667,3 +667,14 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+
+    # ============ VCPO (Visual Causal Policy Optimization) ============
+    # VCPO mode: None (disabled), "sd" (Self-Distillation), "sa" (Self-Alignment)
+    vcpo_mode: Optional[str] = None
+    # Coefficient α for the VCPO causal alignment KL loss
+    vcpo_alpha: float = 0.1
+    # Temperature τ for softmax normalization of gradient attribution
+    vcpo_temperature: float = 1.0
+    # The token string pattern used to extract the answer from model output
+    # e.g., for <answer>xxx</answer> format, set to "answer"
+    vcpo_answer_tag: str = "boxed"
