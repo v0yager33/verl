@@ -184,6 +184,15 @@ class ActorConfig(BaseConfig):
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
 
+    #========================================================================== 
+    # VCPO (Visual Causal Policy Optimization) settings
+    use_vcpo_loss: bool = False
+    vcpo_mode: str = "sa"           # "sd" or "sa"
+    vcpo_alpha: float = 0.1         # coefficient for VCPO loss
+    vcpo_temperature: float = 1.0   # temperature for softmax normalization
+    vcpo_answer_tag: str = "boxed"  # tag to extract answer tokens
+    #==========================================================================
+
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
