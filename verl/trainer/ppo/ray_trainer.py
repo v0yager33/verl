@@ -1686,3 +1686,140 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+    # ================== VCPO-SD data preparation ==================
+    def _prepare_vcpo_sd_gt_inputs(self, data: DataProto) -> Optional[dict]:
+        """将 reference 与 prompt 拼接，应用 chat template 后 tokenize，构造 GT 模型输入。
+
+        关键步骤：
+        1. 从 extra_info 中提取 reference 纯文本
+        2. 从 raw_prompt 中获取原始消息列表（已含图片对象）
+        3. 拼接为 [user_message, assistant_message] 的完整对话
+        4. 调用 processor.apply_chat_template() 应用 chat template
+        5. 调用 processor() 进行 tokenize + 图片处理
+        6. 返回 gt_input_ids, gt_attention_mask, gt_pixel_values 等
+
+        Args:
+            data: DataProto，包含 non_tensor_batch["extra_info"] 和 non_tensor_batch["raw_prompt"]
+
+        Returns:
+            dict with keys: gt_input_ids, gt_attention_mask, gt_response_length, gt_multi_modal_inputs
+            如果所有 reference 都不存在，返回 None
+        """
+        extra_infos = data.non_tensor_batch.get("extra_info", None)
+        raw_prompts = data.non_tensor_batch.get("raw_prompt", None)
+
+        if extra_infos is None or raw_prompts is None:
+            return None
+
+        # 提取 reference 文本
+        references = []
+        for info in extra_infos:
+            info_dict = info if isinstance(info, dict) else {}
+            references.append(info_dict.get("reference", None))
+
+        valid_refs = [r for r in references if r is not None]
+        if len(valid_refs) == 0:
+            return None
+
+        processor = self.processor  # verl 的 RayPPOTrainer 持有 processor
+        tokenizer = self.tokenizer
+
+        gt_input_ids_list = []
+        gt_attention_mask_list = []
+        gt_multi_modal_inputs_list = []
+        gt_response_lengths = []
+
+        for i, reference in enumerate(references):
+            if reference is None:
+                reference = ""
+
+            # ========== 关键：构造完整的对话消息列表 ==========
+            # raw_prompt 已经是经过 _build_messages() 处理的消息列表，
+            # 其中图片已经被替换为 {"type": "image", "image": PIL.Image} 格式
+            import copy
+            messages = copy.deepcopy(raw_prompts[i])
+
+            # 追加 assistant 消息（reference 内容）
+            messages.append({"role": "assistant", "content": reference})
+
+            # ========== 关键：应用 Chat Template ==========
+            # 使用 processor.apply_chat_template 而非直接 tokenize
+            # 这会正确添加 <|im_start|>assistant\n ... <|im_end|> 等特殊 token
+            raw_text = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=False,  # False: 不添加末尾的 assistant 提示
+                tokenize=False,
+            )
+
+            # ========== 处理图片并 tokenize ==========
+            # 从消息中提取图片（与 AgentLoop 中的处理方式一致）
+            from verl.utils.dataset.rl_dataset import RLHFDataset
+            images, videos = await RLHFDataset.process_vision_info(
+                messages=raw_prompts[i],  # 使用原始 prompt 的图片
+                image_patch_size=self.config.data.get("image_patch_size", None),
+                config=self.config.data,
+            )
+
+            if images:
+                encoded = processor(
+                    text=[raw_text],
+                    images=images,
+                    return_tensors="pt",
+                )
+            else:
+                encoded = tokenizer(
+                    raw_text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=(self.config.data.max_prompt_length
+                            + self.config.data.max_response_length),
+                )
+
+            gt_input_ids_list.append(encoded["input_ids"].squeeze(0))
+            gt_attention_mask_list.append(encoded["attention_mask"].squeeze(0))
+
+            # 提取多模态输入（pixel_values, image_grid_thw 等）
+            mm_inputs = {}
+            for key in encoded:
+                if key not in ("input_ids", "attention_mask"):
+                    mm_inputs[key] = encoded[key]
+            gt_multi_modal_inputs_list.append(mm_inputs)
+
+            # ========== 计算 reference 部分的 token 长度 ==========
+            # 方法：对比 prompt-only 和 prompt+reference 的 token 数差值
+            prompt_only_text = processor.apply_chat_template(
+                raw_prompts[i],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if images:
+                prompt_only_encoded = processor(text=[prompt_only_text], images=images, return_tensors="pt")
+            else:
+                prompt_only_encoded = tokenizer(prompt_only_text, return_tensors="pt")
+
+            prompt_token_len = prompt_only_encoded["input_ids"].shape[1]
+            full_token_len = encoded["input_ids"].shape[1]
+            gt_response_lengths.append(full_token_len - prompt_token_len)
+
+        # Pad to same length
+        max_len = max(ids.shape[0] for ids in gt_input_ids_list)
+        batch_size = len(gt_input_ids_list)
+        gt_input_ids = torch.zeros(batch_size, max_len, dtype=torch.long)
+        gt_attention_mask = torch.zeros(batch_size, max_len, dtype=torch.long)
+
+        for i, (ids, mask) in enumerate(zip(gt_input_ids_list, gt_attention_mask_list)):
+            gt_input_ids[i, :ids.shape[0]] = ids
+            gt_attention_mask[i, :mask.shape[0]] = mask
+
+        result = {
+            "gt_input_ids": gt_input_ids,
+            "gt_attention_mask": gt_attention_mask,
+            "gt_response_length": max(gt_response_lengths),
+        }
+
+        # 将多模态输入也存入（用于 GT 前向传播时传给模型）
+        if gt_multi_modal_inputs_list:
+            result["gt_multi_modal_inputs"] = gt_multi_modal_inputs_list
+
+        return result
