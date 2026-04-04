@@ -900,36 +900,6 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
 
-        #===========================================================================
-        # === VCPO: include reward scores and uid for group-based SA computation ===
-        if self.config.get("use_vcpo_loss", False):
-                        vcpo_mode = self.config.get("vcpo_mode", "sa")
-                        vcpo_alpha = self.config.get("vcpo_alpha", 0.1)
-                        vcpo_temperature = self.config.get("vcpo_temperature", 1.0)
-                        vcpo_answer_tag = self.config.get("vcpo_answer_tag", "boxed")
-
-                        # Get tokenizer from meta_info
-                        tokenizer = data.meta_info.get("tokenizer", None)
-
-                        if tokenizer is not None:
-                            vcpo_loss_value = self._compute_vcpo_loss_for_micro_batch(
-                                model=self.actor_module,
-                                micro_batch=micro_batch,
-                                model_inputs=model_inputs,
-                                response_length=micro_batch.batch["responses"].size(-1),
-                                vcpo_mode=vcpo_mode,
-                                vcpo_temperature=vcpo_temperature,
-                                vcpo_answer_tag=vcpo_answer_tag,
-                                tokenizer=tokenizer,
-                                multi_modal_inputs=multi_modal_inputs
-                                    if "multi_modal_inputs" in model_inputs else {},
-                            )
-
-                            if vcpo_loss_value is not None:
-                                policy_loss = policy_loss + vcpo_alpha * vcpo_loss_value
-                                micro_batch_metrics["actor/vcpo_loss"] = vcpo_loss_value.detach().item()
-                                micro_batch_metrics["actor/vcpo_alpha"] = vcpo_alpha
-        #===========================================================================
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -1055,6 +1025,37 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    #===========================================================================
+                    # === VCPO: include reward scores and uid for group-based SA computation ===
+                    if self.config.get("use_vcpo_loss", False):
+                        vcpo_mode = self.config.get("vcpo_mode", "sa")
+                        vcpo_alpha = self.config.get("vcpo_alpha", 0.1)
+                        vcpo_temperature = self.config.get("vcpo_temperature", 1.0)
+                        vcpo_answer_tag = self.config.get("vcpo_answer_tag", "boxed")
+
+                        # Get tokenizer from meta_info
+                        tokenizer = data.meta_info.get("tokenizer", None)
+
+                        if tokenizer is not None:
+                            vcpo_loss_value = self._compute_vcpo_loss_for_micro_batch(
+                                model=self.actor_module,
+                                micro_batch=micro_batch,
+                                model_inputs=model_inputs,
+                                response_length=micro_batch.batch["responses"].size(-1),
+                                vcpo_mode=vcpo_mode,
+                                vcpo_temperature=vcpo_temperature,
+                                vcpo_answer_tag=vcpo_answer_tag,
+                                tokenizer=tokenizer,
+                                multi_modal_inputs=multi_modal_inputs
+                                    if "multi_modal_inputs" in model_inputs else {},
+                            )
+
+                            if vcpo_loss_value is not None:
+                                policy_loss = policy_loss + vcpo_alpha * vcpo_loss_value
+                                micro_batch_metrics["actor/vcpo_loss"] = vcpo_loss_value.detach().item()
+                                micro_batch_metrics["actor/vcpo_alpha"] = vcpo_alpha
+                    #===========================================================================
+                    
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
