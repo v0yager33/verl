@@ -483,3 +483,59 @@ def compute_vcpo_kl_loss(
     # F.kl_div with log_target=True computes: sum(P * (log(P) - log_target))
     # which is KL(P || P_target)
     return kl_loss
+
+def resolve_image_token_id(
+    model: torch.nn.Module,
+    tokenizer,
+    vcpo_image_token: Optional[str] = None,
+) -> int:
+    """解析视觉 token 的 ID。
+
+    优先级：
+    1. 如果指定了 vcpo_image_token（如 "<|image_pad|>"），通过 tokenizer 转换为 ID
+    2. 否则，尝试从 model.config 中自动检测
+    3. 最终 fallback 到 Qwen 默认值 151655
+
+    Args:
+        model: VLM 模型实例
+        tokenizer: tokenizer 实例
+        vcpo_image_token: 用户指定的视觉 token 文本，如 "<|image_pad|>"
+
+    Returns:
+        视觉 token 的整数 ID
+    """
+    # 方式 1：用户显式指定了 token 文本
+    if vcpo_image_token is not None:
+        token_ids = tokenizer.encode(vcpo_image_token, add_special_tokens=False)
+        if len(token_ids) == 1:
+            return token_ids[0]
+        # 如果 encode 出多个 token，尝试用 convert_tokens_to_ids
+        token_id = tokenizer.convert_tokens_to_ids(vcpo_image_token)
+        if token_id != tokenizer.unk_token_id:
+            return token_id
+        raise ValueError(
+            f"vcpo_image_token='{vcpo_image_token}' 无法解析为单个 token ID。"
+            f"tokenizer.encode 结果: {token_ids}，"
+            f"convert_tokens_to_ids 结果: {token_id}。"
+            f"请检查该 token 是否在 tokenizer 的词表中。"
+        )
+
+    # 方式 2：从 model.config 自动检测
+    model_config = getattr(model, "config", None)
+    if model_config is None:
+        model_config = getattr(getattr(model, "module", model), "config", None)
+
+    if model_config is not None:
+        # 尝试多个常见的属性名
+        for attr_name in [
+            "image_token_id",         # Qwen2.5-VL, Qwen3-VL
+            "img_context_token_id",   # InternVL2
+            "image_token_index",      # LLaVA
+            "visual_token_id",        # 其他模型
+        ]:
+            value = getattr(model_config, attr_name, None)
+            if value is not None and isinstance(value, int):
+                return value
+        
+    # 方式 3：Fallback
+    return 151655  # Qwen 系列默认值

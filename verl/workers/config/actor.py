@@ -187,10 +187,11 @@ class ActorConfig(BaseConfig):
     #========================================================================== 
     # VCPO (Visual Causal Policy Optimization) settings
     use_vcpo_loss: bool = False
-    vcpo_mode: str = "sa"           # "sd" or "sa"
-    vcpo_alpha: float = 0.1         # coefficient for VCPO loss
-    vcpo_temperature: float = 1.0   # temperature for softmax normalization
-    vcpo_answer_tag: str = "boxed"  # tag to extract answer tokens
+    vcpo_mode: str = "sa"                   # "sd" or "sa"
+    vcpo_alpha: float = 0.1                 # coefficient for VCPO loss
+    vcpo_temperature: float = 1.0           # temperature for softmax normalization
+    vcpo_answer_tag: str = "boxed"          # tag to extract answer tokens
+    vcpo_image_token: Optional[str] = None  # text of vision token
     #==========================================================================
 
     def __post_init__(self):

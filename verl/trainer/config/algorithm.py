@@ -678,3 +678,5 @@ class AlgoConfig(BaseConfig):
     # The token string pattern used to extract the answer from model output
     # e.g., for <answer>xxx</answer> format, set to "answer"
     vcpo_answer_tag: str = "boxed"
+    # The text of vision token
+    vcpo_image_token: Optional[str] = None

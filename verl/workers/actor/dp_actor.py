@@ -40,6 +40,9 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+import numpy as np
+
+from verl.utils.model import extract_multi_modal_inputs
 from verl.workers.utils.vcpo import (
     find_answer_token_positions,
     compute_gradient_attribution,
@@ -396,7 +399,53 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
             return outputs
-        
+
+    @staticmethod
+    def _resolve_image_token_id(model, tokenizer, vcpo_image_token=None):
+        """Resolve the image token ID for visual token detection.
+
+        Priority:
+            1. User-specified vcpo_image_token text -> tokenizer lookup
+            2. Auto-detect from model.config (tries multiple attribute names)
+            3. Fallback to Qwen default 151655
+        """
+        if vcpo_image_token is not None and tokenizer is not None:
+            token_id = tokenizer.convert_tokens_to_ids(vcpo_image_token)
+            if token_id != tokenizer.unk_token_id:
+                return token_id
+            token_ids = tokenizer.encode(vcpo_image_token, add_special_tokens=False)
+            if len(token_ids) == 1:
+                return token_ids[0]
+
+        model_config = getattr(model, "config", None)
+        if model_config is None:
+            model_config = getattr(getattr(model, "module", model), "config", None)
+        if model_config is not None:
+            for attr_name in ["image_token_id", "img_context_token_id",
+                              "image_token_index", "visual_token_id"]:
+                value = getattr(model_config, attr_name, None)
+                if value is not None and isinstance(value, int):
+                    return value
+        return 151655
+
+    @staticmethod
+    def _get_sample_multi_modal_inputs(raw_mm_list, index):
+        """Extract multi-modal inputs for a single sample from the per-sample list.
+
+        Args:
+            raw_mm_list: list[dict] of per-sample multi-modal inputs, or None.
+            index: Sample index to extract.
+
+        Returns:
+            dict of multi-modal inputs for the single sample.
+        """
+        if raw_mm_list is None or index >= len(raw_mm_list):
+            return {}
+        sample_data = raw_mm_list[index]
+        if sample_data is None:
+            return {}
+        return extract_multi_modal_inputs([sample_data])
+
     def _compute_vcpo_loss_for_micro_batch(
         self,
         model,
@@ -407,20 +456,10 @@ class DataParallelPPOActor(BasePPOActor):
         vcpo_temperature: float,
         vcpo_answer_tag: str,
         tokenizer,
-        multi_modal_inputs: dict,
+        raw_multi_modal_inputs_list: Optional[list],
+        image_token_id: int,
     ) -> Optional[torch.Tensor]:
         """Compute VCPO causal alignment loss for a micro-batch.
-
-        For VCPO-SA mode:
-            1. For each sample, find answer tokens in the response
-            2. Compute gradient attribution for the current sample
-            3. Group samples by uid, collect correct samples' attributions
-            4. Compute target P_SA as mean of correct samples' attributions
-            5. Compute KL(P_current || P_SA) for each sample
-
-        For VCPO-SD mode:
-            1. Use ground truth data to compute target P_SD
-            2. Compute KL(P_current || P_SD) for each sample
 
         Args:
             model: The actor model.
@@ -431,7 +470,8 @@ class DataParallelPPOActor(BasePPOActor):
             vcpo_temperature: Temperature for softmax normalization.
             vcpo_answer_tag: Tag to extract answer tokens.
             tokenizer: Tokenizer instance.
-            multi_modal_inputs: Multi-modal inputs dict.
+            raw_multi_modal_inputs_list: Per-sample list of multi-modal input dicts.
+            image_token_id: Token ID for visual tokens.
 
         Returns:
             Scalar VCPO loss, or None if no valid samples.
@@ -442,22 +482,10 @@ class DataParallelPPOActor(BasePPOActor):
         responses = model_inputs["responses"]
         batch_size = input_ids.shape[0]
 
-        # Detect image token ID from model config
-        model_config = getattr(model, "config", None)
-        if model_config is None:
-            model_config = getattr(getattr(model, "module", model), "config", None)
-
-        image_token_id = getattr(model_config, "image_token_id", 151655)
-
         # Create image token mask
         image_token_mask = (input_ids == image_token_id)  # (batch_size, seq_len)
 
-        # Check if there are any visual tokens
         if not image_token_mask.any():
-            return None
-
-        num_visual_tokens = image_token_mask[0].sum().item()
-        if num_visual_tokens == 0:
             return None
 
         # Find answer token positions for each sample
@@ -475,7 +503,7 @@ class DataParallelPPOActor(BasePPOActor):
                 response_length=response_length,
                 answer_positions_list=answer_positions_list,
                 image_token_mask=image_token_mask,
-                multi_modal_inputs=multi_modal_inputs,
+                raw_multi_modal_inputs_list=raw_multi_modal_inputs_list,
                 model_inputs=model_inputs,
                 batch_size=batch_size,
                 vcpo_temperature=vcpo_temperature,
@@ -492,12 +520,13 @@ class DataParallelPPOActor(BasePPOActor):
                 response_length=response_length,
                 answer_positions_list=answer_positions_list,
                 image_token_mask=image_token_mask,
-                multi_modal_inputs=multi_modal_inputs,
+                raw_multi_modal_inputs_list=raw_multi_modal_inputs_list,
                 model_inputs=model_inputs,
                 batch_size=batch_size,
                 vcpo_temperature=vcpo_temperature,
                 tokenizer=tokenizer,
                 vcpo_answer_tag=vcpo_answer_tag,
+                image_token_id=image_token_id,
             )
         return None
 
@@ -511,7 +540,7 @@ class DataParallelPPOActor(BasePPOActor):
         response_length,
         answer_positions_list,
         image_token_mask,
-        multi_modal_inputs,
+        raw_multi_modal_inputs_list,
         model_inputs,
         batch_size,
         vcpo_temperature,
@@ -544,7 +573,7 @@ class DataParallelPPOActor(BasePPOActor):
                 response_length=response_length,
                 answer_token_positions=answer_positions_list[i],
                 image_token_mask=image_token_mask[i : i + 1],
-                multi_modal_inputs=self._slice_multi_modal_inputs(multi_modal_inputs, i),
+                multi_modal_inputs=self._get_sample_multi_modal_inputs(raw_multi_modal_inputs_list, i),
                 temperature=1.0,
             )
 
@@ -559,14 +588,14 @@ class DataParallelPPOActor(BasePPOActor):
             # Group by uid
             uid_to_indices = {}
             for i in range(batch_size):
-                uid = uids[i] if isinstance(uids, (list, tuple)) else uids
-                if uid not in uid_to_indices:
-                    uid_to_indices[uid] = []
-                uid_to_indices[uid].append(i)
+                uid_val = str(uids[i]) if isinstance(uids, (list, tuple, np.ndarray)) else str(uids)
+                if uid_val not in uid_to_indices:
+                    uid_to_indices[uid_val] = []
+                uid_to_indices[uid_val].append(i)
 
             # For each group, compute P_SA from correct samples
-            group_targets = {}  # uid -> P_SA
-            for uid, indices in uid_to_indices.items():
+            group_targets = {}  # uid_str -> P_SA
+            for uid_val, indices in uid_to_indices.items():
                 correct_attrs = []
                 for idx in indices:
                     if idx in sample_attributions and vcpo_rewards[idx].item() == 1.0:
@@ -578,7 +607,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if len(correct_attrs) > 0:
                     stacked = torch.stack(correct_attrs, dim=0)
                     mean_attr = stacked.mean(dim=0)
-                    group_targets[uid] = compute_causal_probability(
+                    group_targets[uid_val] = compute_causal_probability(
                         mean_attr, vcpo_temperature
                     )
 
@@ -587,13 +616,13 @@ class DataParallelPPOActor(BasePPOActor):
             for i in range(batch_size):
                 if i not in sample_attributions:
                     continue
-                uid = uids[i] if isinstance(uids, (list, tuple)) else uids
-                if uid not in group_targets:
+                uid_val = str(uids[i]) if isinstance(uids, (list, tuple, np.ndarray)) else str(uids)
+                if uid_val not in group_targets:
                     continue
 
                 kl_loss = compute_vcpo_kl_loss(
                     current_attribution=sample_attributions[i],
-                    target_attribution=group_targets[uid],
+                    target_attribution=group_targets[uid_val],
                     temperature=vcpo_temperature,
                 )
                 kl_losses.append(kl_loss)
@@ -632,12 +661,13 @@ class DataParallelPPOActor(BasePPOActor):
         response_length,
         answer_positions_list,
         image_token_mask,
-        multi_modal_inputs,
+        raw_multi_modal_inputs_list,
         model_inputs,
         batch_size,
         vcpo_temperature,
         tokenizer,
         vcpo_answer_tag,
+        image_token_id,
     ) -> Optional[torch.Tensor]:
         """Compute VCPO-SD loss using Self-Distillation (ground truth answer).
 
@@ -655,12 +685,6 @@ class DataParallelPPOActor(BasePPOActor):
             return None
 
         # Compute P_SD from ground truth
-        gt_image_token_mask = (gt_input_ids == image_token_mask.long().sum())
-        # Re-detect image token ID
-        model_config = getattr(model, "config", None)
-        if model_config is None:
-            model_config = getattr(getattr(model, "module", model), "config", None)
-        image_token_id = getattr(model_config, "image_token_id", 151655)
         gt_image_token_mask = (gt_input_ids == image_token_id)
 
         gt_response_ids = gt_input_ids[:, -gt_response_length:]
@@ -670,6 +694,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         if gt_answer_positions[0] is None:
             return None
+
+        # Get GT multi-modal inputs
+        gt_multi_modal_inputs = model_inputs.get("gt_multi_modal_inputs", None)
+        if gt_multi_modal_inputs is None:
+            gt_multi_modal_inputs = self._get_sample_multi_modal_inputs(raw_multi_modal_inputs_list, 0)
 
         # Compute target attribution from GT
         gt_grad_attr = compute_gradient_attribution(
@@ -681,7 +710,7 @@ class DataParallelPPOActor(BasePPOActor):
             response_length=gt_response_length,
             answer_token_positions=gt_answer_positions[0],
             image_token_mask=gt_image_token_mask[0:1],
-            multi_modal_inputs=self._slice_multi_modal_inputs(multi_modal_inputs, 0),
+            multi_modal_inputs=gt_multi_modal_inputs,
             temperature=1.0,
         )
 
@@ -705,7 +734,7 @@ class DataParallelPPOActor(BasePPOActor):
                 response_length=response_length,
                 answer_token_positions=answer_positions_list[i],
                 image_token_mask=image_token_mask[i : i + 1],
-                multi_modal_inputs=self._slice_multi_modal_inputs(multi_modal_inputs, i),
+                multi_modal_inputs=self._get_sample_multi_modal_inputs(raw_multi_modal_inputs_list, i),
                 temperature=1.0,
             )
 
@@ -720,25 +749,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         return torch.stack(kl_losses).mean()
 
-    # _slice_multi_modal_inputs 方法对于 VLM 的多模态输入切片是简化版本。
-    # 在实际实现中，需要根据具体的 VLM 模型（如 Qwen2.5-VL）的多模态输入格式进行适配。
-    # 对于 Qwen2.5-VL，pixel_values 是所有图片 patch 拼接在一起的，
-    # image_grid_thw 记录了每张图的 grid 信息，
-    # 切片时需要根据 image_grid_thw 来正确分割 pixel_values。
-    @staticmethod
-    def _slice_multi_modal_inputs(multi_modal_inputs: dict, index: int) -> dict:
-        """Slice multi-modal inputs for a single sample from a batch."""
-        sliced = {}
-        for key, value in multi_modal_inputs.items():
-            if isinstance(value, torch.Tensor):
-                if value.dim() > 0 and value.shape[0] > index:
-                    sliced[key] = value[index : index + 1]
-                else:
-                    sliced[key] = value
-            else:
-                sliced[key] = value
-        return sliced
-    
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -1031,16 +1041,28 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    #===========================================================================
-                    # === VCPO: include reward scores and uid for group-based SA computation ===
+                    # ========== VCPO: compute causal alignment loss ==========
                     if self.config.get("use_vcpo_loss", False):
                         vcpo_mode = self.config.get("vcpo_mode", "sa")
                         vcpo_alpha = self.config.get("vcpo_alpha", 0.1)
                         vcpo_temperature = self.config.get("vcpo_temperature", 1.0)
                         vcpo_answer_tag = self.config.get("vcpo_answer_tag", "boxed")
 
-                        # Get tokenizer from meta_info
                         tokenizer = data.meta_info.get("tokenizer", None)
+
+                        # Get per-sample multi-modal inputs list (list[dict])
+                        raw_mm_list = (
+                            micro_batch.non_tensor_batch.get("multi_modal_inputs", None)
+                            if hasattr(micro_batch, "non_tensor_batch") else None
+                        )
+                        if raw_mm_list is not None and not isinstance(raw_mm_list, list):
+                            raw_mm_list = list(raw_mm_list) if hasattr(raw_mm_list, '__iter__') else None
+
+                        # Resolve image token ID (supports Qwen, InternVL, LLaVA, etc.)
+                        vcpo_image_token = self.config.get("vcpo_image_token", None)
+                        resolved_image_token_id = self._resolve_image_token_id(
+                            self.actor_module, tokenizer, vcpo_image_token
+                        ) if tokenizer is not None else 151655
 
                         if tokenizer is not None:
                             vcpo_loss_value = self._compute_vcpo_loss_for_micro_batch(
@@ -1052,15 +1074,15 @@ class DataParallelPPOActor(BasePPOActor):
                                 vcpo_temperature=vcpo_temperature,
                                 vcpo_answer_tag=vcpo_answer_tag,
                                 tokenizer=tokenizer,
-                                multi_modal_inputs=multi_modal_inputs
-                                    if "multi_modal_inputs" in model_inputs else {},
+                                raw_multi_modal_inputs_list=raw_mm_list,
+                                image_token_id=resolved_image_token_id,
                             )
 
                             if vcpo_loss_value is not None:
                                 policy_loss = policy_loss + vcpo_alpha * vcpo_loss_value
                                 micro_batch_metrics["actor/vcpo_loss"] = vcpo_loss_value.detach().item()
                                 micro_batch_metrics["actor/vcpo_alpha"] = vcpo_alpha
-                    #===========================================================================
+                    # ========== VCPO END ==========
                     
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
