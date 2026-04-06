@@ -458,7 +458,7 @@ class DataParallelPPOActor(BasePPOActor):
         tokenizer,
         raw_multi_modal_inputs_list: Optional[list],
         image_token_id: int,
-    ) -> Optional[torch.Tensor]:
+    ) -> tuple:
         """Compute VCPO causal alignment loss for a micro-batch.
 
         Args:
@@ -474,7 +474,7 @@ class DataParallelPPOActor(BasePPOActor):
             image_token_id: Token ID for visual tokens.
 
         Returns:
-            Scalar VCPO loss, or None if no valid samples.
+            Tuple of (scalar VCPO loss or None, stats dict).
         """
         input_ids = model_inputs["input_ids"]
         attention_mask = model_inputs["attention_mask"]
@@ -485,13 +485,16 @@ class DataParallelPPOActor(BasePPOActor):
         # Create image token mask
         image_token_mask = (input_ids == image_token_id)  # (batch_size, seq_len)
 
+        num_image_tokens = image_token_mask.sum().item()
         if not image_token_mask.any():
-            return None
+            return None, {"actor/vcpo_skip_reason": 0.0, "actor/vcpo_num_image_tokens": 0.0}
 
         # Find answer token positions for each sample
         answer_positions_list = find_answer_token_positions(
             responses, tokenizer, vcpo_answer_tag
         )
+
+        base_stats = {"actor/vcpo_num_image_tokens": float(num_image_tokens)}
 
         if vcpo_mode == "sa":
             return self._compute_vcpo_sa_loss(
@@ -509,6 +512,7 @@ class DataParallelPPOActor(BasePPOActor):
                 vcpo_temperature=vcpo_temperature,
                 tokenizer=tokenizer,
                 vcpo_answer_tag=vcpo_answer_tag,
+                base_stats=base_stats,
             )
         elif vcpo_mode == "sd":
             return self._compute_vcpo_sd_loss(
@@ -527,8 +531,9 @@ class DataParallelPPOActor(BasePPOActor):
                 tokenizer=tokenizer,
                 vcpo_answer_tag=vcpo_answer_tag,
                 image_token_id=image_token_id,
+                base_stats=base_stats,
             )
-        return None
+        return None, base_stats
 
     def _compute_vcpo_sa_loss(
         self,
@@ -668,21 +673,28 @@ class DataParallelPPOActor(BasePPOActor):
         tokenizer,
         vcpo_answer_tag,
         image_token_id,
-    ) -> Optional[torch.Tensor]:
+        base_stats: dict = None,
+    ) -> tuple:
         """Compute VCPO-SD loss using Self-Distillation (ground truth answer).
 
         Steps:
             1. Use GT data to compute P_SD (target attribution)
             2. Compute gradient attribution for each rollout sample
             3. Compute KL(P_i || P_SD) for each sample
+
+        Returns:
+            Tuple of (scalar loss or None, stats dict).
         """
+        stats = dict(base_stats) if base_stats else {}
+
         gt_input_ids = model_inputs.get("gt_input_ids", None)
         gt_attention_mask = model_inputs.get("gt_attention_mask", None)
         gt_position_ids = model_inputs.get("gt_position_ids", None)
         gt_response_length = model_inputs.get("gt_response_length", None)
 
         if gt_input_ids is None:
-            return None
+            stats["actor/vcpo_skip_reason"] = 4.0  # no GT input_ids
+            return None, stats
 
         # Compute P_SD from ground truth
         gt_image_token_mask = (gt_input_ids == image_token_id)
@@ -693,7 +705,8 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
         if gt_answer_positions[0] is None:
-            return None
+            stats["actor/vcpo_skip_reason"] = 5.0  # no GT answer position
+            return None, stats
 
         # Get GT multi-modal inputs
         gt_multi_modal_inputs = model_inputs.get("gt_multi_modal_inputs", None)
@@ -715,7 +728,8 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
         if gt_grad_attr is None:
-            return None
+            stats["actor/vcpo_skip_reason"] = 6.0  # GT grad attribution failed
+            return None, stats
 
         target_prob = compute_causal_probability(gt_grad_attr, vcpo_temperature)
 
@@ -744,10 +758,14 @@ class DataParallelPPOActor(BasePPOActor):
                 )
                 kl_losses.append(kl_loss)
 
-        if len(kl_losses) == 0:
-            return None
+        stats["actor/vcpo_num_valid_samples"] = float(len(kl_losses))
+        stats["actor/vcpo_num_kl_pairs"] = float(len(kl_losses))
 
-        return torch.stack(kl_losses).mean()
+        if len(kl_losses) == 0:
+            stats["actor/vcpo_skip_reason"] = 7.0  # no valid rollout attributions
+            return None, stats
+
+        return torch.stack(kl_losses).mean(), stats
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -1048,7 +1066,8 @@ class DataParallelPPOActor(BasePPOActor):
                         vcpo_temperature = self.config.get("vcpo_temperature", 1.0)
                         vcpo_answer_tag = self.config.get("vcpo_answer_tag", "boxed")
 
-                        tokenizer = data.meta_info.get("tokenizer", None)
+                        # Use tokenizer held by the actor (set during __init__)
+                        tokenizer = self.tokenizer
 
                         # Get per-sample multi-modal inputs list (list[dict])
                         raw_mm_list = (
