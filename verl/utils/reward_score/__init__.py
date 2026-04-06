@@ -103,6 +103,12 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source in ["virl39k", "spatial_dise"]:
+        # 多选题数据集：比较答案字母是否匹配
+        from . import multiple_choice
+
+        res = multiple_choice.compute_score(solution_str, ground_truth)
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
