@@ -48,3 +48,23 @@ calculate_sum_pi_squared: False
 
 # Enable gradient checkpointing for sum_pi_squared computation (saves memory)
 sum_pi_squared_checkpointing: False
+
+# ============ VCPO (Visual Causal Policy Optimization) ============
+# Whether to enable VCPO causal alignment loss
+use_vcpo_loss: False
+
+# VCPO mode: null (disabled), "sd" (Self-Distillation), "sa" (Self-Alignment)
+vcpo_mode: null
+
+# Coefficient α for the VCPO causal alignment KL loss
+vcpo_alpha: 0.1
+
+# Temperature τ for softmax normalization of gradient attribution
+vcpo_temperature: 1.0
+
+# The token string pattern used to extract the answer from model output
+vcpo_answer_tag: boxed
+
+# The text of vision token (e.g., "<|image_pad|>" for Qwen-VL)
+# If null, will be auto-detected from model config
+vcpo_image_token: null
