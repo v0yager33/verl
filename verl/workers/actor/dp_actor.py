@@ -1065,7 +1065,7 @@ class DataParallelPPOActor(BasePPOActor):
                         ) if tokenizer is not None else 151655
 
                         if tokenizer is not None:
-                            vcpo_loss_value = self._compute_vcpo_loss_for_micro_batch(
+                            vcpo_loss_value, vcpo_stats = self._compute_vcpo_loss_for_micro_batch(
                                 model=self.actor_module,
                                 micro_batch=micro_batch,
                                 model_inputs=model_inputs,
@@ -1078,10 +1078,16 @@ class DataParallelPPOActor(BasePPOActor):
                                 image_token_id=resolved_image_token_id,
                             )
 
+                            # Record all VCPO attribution statistics
+                            micro_batch_metrics.update(vcpo_stats)
+                            micro_batch_metrics["actor/vcpo_mode"] = vcpo_mode
+
                             if vcpo_loss_value is not None:
-                                policy_loss = policy_loss + vcpo_alpha * vcpo_loss_value
+                                vcpo_weighted = vcpo_alpha * vcpo_loss_value
+                                policy_loss = policy_loss + vcpo_weighted
                                 micro_batch_metrics["actor/vcpo_loss"] = vcpo_loss_value.detach().item()
                                 micro_batch_metrics["actor/vcpo_alpha"] = vcpo_alpha
+                                micro_batch_metrics["actor/vcpo_weighted_loss"] = vcpo_weighted.detach().item()
                     # ========== VCPO END ==========
                     
                     if self.config.use_dynamic_bsz:
