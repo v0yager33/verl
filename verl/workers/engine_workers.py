@@ -569,6 +569,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
+
+            # VCPO: bind model to loss_fn for gradient attribution
+            if actor_config.use_vcpo_loss:
+                vcpo_model = self.actor.engine.module
+                self.loss_fn = partial(self.loss_fn, vcpo_model=vcpo_model)
+
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 

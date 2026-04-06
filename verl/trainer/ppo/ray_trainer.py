@@ -1220,8 +1220,14 @@ class RayPPOTrainer:
         # ========== VCPO: 传递 tokenizer 和 reward 信息 ==========
         vcpo_mode = self.config.algorithm.get("vcpo_mode", None)
         if vcpo_mode is not None:
-            # 传递 tokenizer（dp_actor 中需要用来 decode response 找答案位置）
+            # 传递 tokenizer（losses.py 中需要用来 decode response 找答案位置）
             batch.meta_info["tokenizer"] = self.tokenizer
+
+            # 保存 padded input tensors for VCPO gradient attribution
+            # (left_right_2_no_padding 会把 input_ids 转成 nested tensor，VCPO 需要 padded 版本)
+            batch.batch["vcpo_input_ids"] = batch.batch["input_ids"].clone()
+            batch.batch["vcpo_attention_mask"] = batch.batch["attention_mask"].clone()
+            batch.batch["vcpo_position_ids"] = batch.batch["position_ids"].clone()
 
             # 传递 reward 信息：将 token_level_scores 的 sum 作为 vcpo_rewards
             # vcpo_rewards 用于 SA 模式下区分正确/错误样本

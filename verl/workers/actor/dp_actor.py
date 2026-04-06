@@ -1066,10 +1066,8 @@ class DataParallelPPOActor(BasePPOActor):
                         vcpo_temperature = self.config.get("vcpo_temperature", 1.0)
                         vcpo_answer_tag = self.config.get("vcpo_answer_tag", "boxed")
 
-                        # Use tokenizer held by the actor (set during __init__)
                         tokenizer = self.tokenizer
 
-                        # Get per-sample multi-modal inputs list (list[dict])
                         raw_mm_list = (
                             micro_batch.non_tensor_batch.get("multi_modal_inputs", None)
                             if hasattr(micro_batch, "non_tensor_batch") else None
@@ -1077,7 +1075,6 @@ class DataParallelPPOActor(BasePPOActor):
                         if raw_mm_list is not None and not isinstance(raw_mm_list, list):
                             raw_mm_list = list(raw_mm_list) if hasattr(raw_mm_list, '__iter__') else None
 
-                        # Resolve image token ID (supports Qwen, InternVL, LLaVA, etc.)
                         vcpo_image_token = self.config.get("vcpo_image_token", None)
                         resolved_image_token_id = self._resolve_image_token_id(
                             self.actor_module, tokenizer, vcpo_image_token
